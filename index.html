@@ -1,0 +1,793 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>展品相機對準測試－快速啟動版</title>
+
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 20px;
+    font-family: system-ui, -apple-system, "Noto Sans TC", sans-serif;
+    background: #f3ead8;
+    color: #281b0e;
+  }
+  main {
+    max-width: 620px;
+    margin: auto;
+  }
+  h1 { font-size: 1.5rem; }
+  button {
+    width: 100%;
+    min-height: 72px;
+    margin: 10px 0;
+    border: 2px solid #281b0e;
+    border-radius: 16px;
+    background: #fffaf0;
+    color: #281b0e;
+    font-size: 1.25rem;
+    font-weight: 700;
+  }
+  button:disabled { opacity: .55; }
+  #statusVisible {
+    min-height: 72px;
+    margin: 16px 0;
+    padding: 14px;
+    background: #fffaf0;
+    border-radius: 14px;
+    font-size: 1.1rem;
+    line-height: 1.5;
+  }
+  #preview {
+    display: block;
+    width: 100%;
+    margin-top: 14px;
+    border-radius: 14px;
+    background: #000;
+  }
+  .tester {
+    margin-top: 15px;
+    padding: 12px;
+    background: rgba(255,255,255,.6);
+    border-radius: 12px;
+  }
+  #debug { font-size: .9rem; }
+  video, #processCanvas, .reference { display: none; }
+  .sr-only {
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    padding: 0 !important;
+    margin: -1px !important;
+    overflow: hidden !important;
+    clip: rect(0,0,0,0) !important;
+    white-space: nowrap !important;
+    border: 0 !important;
+  }
+</style>
+</head>
+
+<body>
+<main>
+  <h1>展品相機對準測試</h1>
+
+  <button id="startButton">開始相機導覽</button>
+  <button id="stopButton" hidden>結束相機導覽</button>
+
+  <div id="statusVisible">
+    可以先按「開始相機導覽」。影像辨識會在背景準備，不必等它準備完成才開相機。
+  </div>
+
+  <div id="liveRegion"
+       class="sr-only"
+       role="status"
+       aria-live="assertive"
+       aria-atomic="true"></div>
+
+  <canvas id="preview"
+          width="360"
+          height="480"
+          aria-hidden="true"></canvas>
+
+  <div class="tester">
+    <label>
+      <input type="checkbox" id="browserSpeech">
+      未開 VoiceOver / TalkBack 時，用瀏覽器語音測試
+    </label>
+    <div id="debug" aria-hidden="true"></div>
+  </div>
+
+  <video id="video"
+         autoplay
+         muted
+         playsinline
+         aria-hidden="true"></video>
+
+  <canvas id="processCanvas" aria-hidden="true"></canvas>
+
+  <img id="ref1" class="reference" src="./p1.jpg" alt="">
+  <img id="ref2" class="reference" src="./p2.jpg" alt="">
+</main>
+
+<script>
+/* =====================================================
+   OpenCV 背景載入
+===================================================== */
+
+window.opencvReady = false;
+
+window.onOpenCvScriptLoaded = async function () {
+  try {
+    if (window.cv && typeof window.cv.then === "function") {
+      window.cv = await window.cv;
+    }
+
+    while (!window.cv || !window.cv.Mat) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+
+    window.opencvReady = true;
+    document.dispatchEvent(new Event("opencv-ready"));
+
+  } catch (e) {
+    console.error("OpenCV 初始化失敗", e);
+  }
+};
+</script>
+
+<script async
+        src="https://docs.opencv.org/4.13.0/opencv.js"
+        onload="onOpenCvScriptLoaded()"></script>
+
+<script>
+/* =====================================================
+   設定
+===================================================== */
+
+const PROCESS_WIDTH = 300;
+
+/*
+  這版把分析間隔從 800ms 降到 350ms。
+  影像判斷會比較即時，但語音本身仍有限速。
+*/
+const ANALYZE_INTERVAL = 350;
+
+const MATCH_THRESHOLD = 0.43;
+const CENTER_TOLERANCE_X = 0.12;
+const CENTER_TOLERANCE_Y = 0.12;
+
+const SAME_MESSAGE_GAP = 2200;
+
+
+/* =====================================================
+   DOM
+===================================================== */
+
+const video = document.getElementById("video");
+const processCanvas = document.getElementById("processCanvas");
+const preview = document.getElementById("preview");
+
+const processCtx = processCanvas.getContext("2d", {
+  willReadFrequently: true
+});
+const previewCtx = preview.getContext("2d");
+
+const startButton = document.getElementById("startButton");
+const stopButton = document.getElementById("stopButton");
+const statusVisible = document.getElementById("statusVisible");
+const liveRegion = document.getElementById("liveRegion");
+const browserSpeech = document.getElementById("browserSpeech");
+const debug = document.getElementById("debug");
+
+
+/* =====================================================
+   狀態
+===================================================== */
+
+let stream = null;
+let running = false;
+let timer = null;
+
+let cvReady = false;
+let referencesReady = false;
+let referenceImages = [];
+
+let lastMessage = "";
+let lastMessageTime = 0;
+
+let centeredCount = 0;
+let lastDetectedId = null;
+let analysisStarted = false;
+
+
+/* =====================================================
+   共用
+===================================================== */
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+
+/* =====================================================
+   語音提示
+===================================================== */
+
+function announce(message, force = false) {
+  const now = Date.now();
+
+  if (
+    !force &&
+    message === lastMessage &&
+    now - lastMessageTime < SAME_MESSAGE_GAP
+  ) {
+    return;
+  }
+
+  lastMessage = message;
+  lastMessageTime = now;
+
+  statusVisible.textContent = message;
+
+  liveRegion.textContent = "";
+  setTimeout(() => {
+    liveRegion.textContent = message;
+  }, 40);
+
+  if (browserSpeech.checked && "speechSynthesis" in window) {
+    speechSynthesis.cancel();
+
+    const u = new SpeechSynthesisUtterance(message);
+    u.lang = "zh-TW";
+    u.rate = 0.95;
+
+    speechSynthesis.speak(u);
+  }
+}
+
+
+/* =====================================================
+   震動
+===================================================== */
+
+function vibrateFound() {
+  if ("vibrate" in navigator) {
+    navigator.vibrate(80);
+  }
+}
+
+function vibrateCentered() {
+  if ("vibrate" in navigator) {
+    navigator.vibrate([90, 70, 90]);
+  }
+}
+
+
+/* =====================================================
+   參考照片
+===================================================== */
+
+async function waitForImage(img) {
+  if (img.complete && img.naturalWidth > 0) {
+    return;
+  }
+
+  await new Promise((resolve, reject) => {
+    img.addEventListener("load", resolve, { once: true });
+    img.addEventListener("error", reject, { once: true });
+  });
+}
+
+
+function prepareReference(img, id, name) {
+  let rgba = cv.imread(img);
+  let gray = new cv.Mat();
+  let blurred = new cv.Mat();
+  let edges = new cv.Mat();
+
+  cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY);
+  cv.GaussianBlur(gray, blurred, new cv.Size(3, 3), 0);
+  cv.Canny(blurred, edges, 60, 150);
+
+  const aspect = img.naturalHeight / img.naturalWidth;
+
+  rgba.delete();
+  gray.delete();
+  blurred.delete();
+
+  return {
+    id,
+    name,
+    edges,
+    aspect
+  };
+}
+
+
+/* =====================================================
+   背景初始化
+   OpenCV 與照片同時準備，不阻塞「開相機」
+===================================================== */
+
+async function prepareRecognition() {
+  try {
+    const img1 = document.getElementById("ref1");
+    const img2 = document.getElementById("ref2");
+
+    const imagesPromise = Promise.all([
+      waitForImage(img1),
+      waitForImage(img2)
+    ]);
+
+    while (!window.opencvReady) {
+      await sleep(80);
+    }
+
+    cvReady = true;
+    await imagesPromise;
+
+    referenceImages = [
+      prepareReference(img1, 1, "第一件展品"),
+      prepareReference(img2, 2, "第二件展品")
+    ];
+
+    referencesReady = true;
+
+    if (running) {
+      startAnalysisIfReady();
+    } else {
+      statusVisible.textContent =
+        "影像辨識已準備完成。可以按「開始相機導覽」。";
+    }
+
+  } catch (error) {
+    console.error(error);
+
+    statusVisible.textContent =
+      "影像辨識初始化失敗。請確認 p1.jpg、p2.jpg 與網路連線。";
+  }
+}
+
+
+/* =====================================================
+   啟動相機
+   重點：不等待 OpenCV，先把相機開起來
+===================================================== */
+
+async function startCamera() {
+  try {
+    if (
+      !navigator.mediaDevices ||
+      !navigator.mediaDevices.getUserMedia
+    ) {
+      announce(
+        "這個瀏覽器目前無法使用相機導覽。",
+        true
+      );
+      return;
+    }
+
+    startButton.disabled = true;
+
+    announce(
+      "請先停在原地。相機導覽只會協助您轉動手機，不會指示您向前行走。",
+      true
+    );
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 960 },
+        height: { ideal: 720 }
+      }
+    });
+
+    video.srcObject = stream;
+    await video.play();
+
+    while (!video.videoWidth || !video.videoHeight) {
+      await sleep(50);
+    }
+
+    const ratio = video.videoHeight / video.videoWidth;
+
+    processCanvas.width = PROCESS_WIDTH;
+    processCanvas.height = Math.round(PROCESS_WIDTH * ratio);
+
+    preview.width = PROCESS_WIDTH;
+    preview.height = processCanvas.height;
+
+    running = true;
+    analysisStarted = false;
+
+    startButton.hidden = true;
+    startButton.disabled = false;
+    stopButton.hidden = false;
+
+    if (cvReady && referencesReady) {
+      announce(
+        "相機已開啟。展品辨識已啟動。您剛進入展場時，手機可能會先朝向門口或沒有展品的區域，這是正常的。請保持站在原地，慢慢將手機向左右轉動。",
+        true
+      );
+
+      startAnalysisIfReady();
+
+    } else {
+      announce(
+        "相機已開啟。影像辨識正在背景準備。請先保持站在原地並拿穩手機。",
+        true
+      );
+
+      /*
+        等辨識引擎好了之後會自動接上，
+        不需要使用者再按一次。
+      */
+      waitUntilRecognitionReady();
+    }
+
+  } catch (error) {
+    console.error(error);
+
+    startButton.hidden = false;
+    startButton.disabled = false;
+    stopButton.hidden = true;
+
+    announce(
+      "無法開啟相機。請確認已允許網站使用相機。",
+      true
+    );
+  }
+}
+
+
+async function waitUntilRecognitionReady() {
+  while (
+    running &&
+    !(cvReady && referencesReady)
+  ) {
+    await sleep(100);
+  }
+
+  if (!running) return;
+
+  announce(
+    "展品辨識已啟動。請保持站在原地，慢慢將手機向左右轉動。",
+    true
+  );
+
+  startAnalysisIfReady();
+}
+
+
+/* =====================================================
+   分析定時器
+===================================================== */
+
+function startAnalysisIfReady() {
+  if (
+    !running ||
+    !cvReady ||
+    !referencesReady ||
+    analysisStarted
+  ) {
+    return;
+  }
+
+  analysisStarted = true;
+
+  analyzeFrame();
+
+  timer = setInterval(
+    analyzeFrame,
+    ANALYZE_INTERVAL
+  );
+}
+
+
+/* =====================================================
+   停止
+===================================================== */
+
+function stopCamera() {
+  running = false;
+  analysisStarted = false;
+
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+    stream = null;
+  }
+
+  video.srcObject = null;
+
+  startButton.hidden = false;
+  startButton.disabled = false;
+  stopButton.hidden = true;
+
+  centeredCount = 0;
+  lastDetectedId = null;
+
+  announce(
+    "相機導覽已結束。",
+    true
+  );
+}
+
+
+/* =====================================================
+   Template matching
+   這版減少尺寸數量，提高速度
+===================================================== */
+
+function matchReference(frameEdges, reference) {
+  const widths = [
+    75,
+    110,
+    155,
+    205,
+    260
+  ];
+
+  let best = {
+    score: -1,
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0
+  };
+
+  for (const targetWidth of widths) {
+    const targetHeight =
+      Math.round(targetWidth * reference.aspect);
+
+    if (
+      targetWidth >= frameEdges.cols ||
+      targetHeight >= frameEdges.rows ||
+      targetHeight < 20
+    ) {
+      continue;
+    }
+
+    let template = new cv.Mat();
+    let result = new cv.Mat();
+
+    cv.resize(
+      reference.edges,
+      template,
+      new cv.Size(targetWidth, targetHeight),
+      0,
+      0,
+      cv.INTER_AREA
+    );
+
+    cv.matchTemplate(
+      frameEdges,
+      template,
+      result,
+      cv.TM_CCOEFF_NORMED
+    );
+
+    const minMax = cv.minMaxLoc(result);
+
+    if (minMax.maxVal > best.score) {
+      best = {
+        score: minMax.maxVal,
+        x: minMax.maxLoc.x,
+        y: minMax.maxLoc.y,
+        width: targetWidth,
+        height: targetHeight
+      };
+    }
+
+    template.delete();
+    result.delete();
+  }
+
+  return best;
+}
+
+
+/* =====================================================
+   相機畫面分析
+===================================================== */
+
+function analyzeFrame() {
+  if (
+    !running ||
+    !cvReady ||
+    !referencesReady ||
+    video.readyState < 2
+  ) {
+    return;
+  }
+
+  processCtx.drawImage(
+    video,
+    0,
+    0,
+    processCanvas.width,
+    processCanvas.height
+  );
+
+  previewCtx.drawImage(
+    video,
+    0,
+    0,
+    preview.width,
+    preview.height
+  );
+
+  let src = cv.imread(processCanvas);
+  let gray = new cv.Mat();
+  let blurred = new cv.Mat();
+  let edges = new cv.Mat();
+
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  cv.GaussianBlur(gray, blurred, new cv.Size(3, 3), 0);
+  cv.Canny(blurred, edges, 60, 150);
+
+  let bestOverall = null;
+
+  for (const reference of referenceImages) {
+    const match = matchReference(edges, reference);
+
+    if (!bestOverall || match.score > bestOverall.score) {
+      bestOverall = {
+        ...match,
+        id: reference.id,
+        name: reference.name
+      };
+    }
+  }
+
+  src.delete();
+  gray.delete();
+  blurred.delete();
+  edges.delete();
+
+  if (!bestOverall) return;
+
+  debug.textContent =
+    "辨識：" +
+    bestOverall.name +
+    " / 分數：" +
+    bestOverall.score.toFixed(3);
+
+  if (bestOverall.score < MATCH_THRESHOLD) {
+    centeredCount = 0;
+    lastDetectedId = null;
+
+    announce(
+      "目前鏡頭範圍內尚未偵測到展品。請保持站在原地，慢慢將手機轉向其他方向。"
+    );
+    return;
+  }
+
+  /*
+    綠框只是給明眼測試者看。
+    對 VoiceOver / TalkBack 隱藏。
+  */
+  previewCtx.strokeStyle = "#00ff55";
+  previewCtx.lineWidth = 5;
+
+  previewCtx.strokeRect(
+    bestOverall.x,
+    bestOverall.y,
+    bestOverall.width,
+    bestOverall.height
+  );
+
+  if (lastDetectedId !== bestOverall.id) {
+    lastDetectedId = bestOverall.id;
+    centeredCount = 0;
+
+    vibrateFound();
+
+    announce(
+      "已偵測到" +
+      bestOverall.name +
+      "。正在協助您將手機對準展品。",
+      true
+    );
+  }
+
+  const objectCenterX =
+    bestOverall.x + bestOverall.width / 2;
+
+  const objectCenterY =
+    bestOverall.y + bestOverall.height / 2;
+
+  const frameCenterX =
+    processCanvas.width / 2;
+
+  const frameCenterY =
+    processCanvas.height / 2;
+
+  const dx =
+    (objectCenterX - frameCenterX) /
+    processCanvas.width;
+
+  const dy =
+    (objectCenterY - frameCenterY) /
+    processCanvas.height;
+
+  const horizontalError =
+    Math.abs(dx) / CENTER_TOLERANCE_X;
+
+  const verticalError =
+    Math.abs(dy) / CENTER_TOLERANCE_Y;
+
+  if (
+    Math.abs(dx) > CENTER_TOLERANCE_X ||
+    Math.abs(dy) > CENTER_TOLERANCE_Y
+  ) {
+    centeredCount = 0;
+
+    if (horizontalError >= verticalError) {
+      if (dx > 0) {
+        announce("請將手機鏡頭稍微向右轉。");
+      } else {
+        announce("請將手機鏡頭稍微向左轉。");
+      }
+    } else {
+      if (dy > 0) {
+        announce("請將手機鏡頭稍微往下轉。");
+      } else {
+        announce("請將手機鏡頭稍微往上轉。");
+      }
+    }
+
+    return;
+  }
+
+  centeredCount++;
+
+  if (centeredCount === 1) {
+    announce(
+      "很好，展品已接近畫面中央，請保持手機穩定。"
+    );
+  }
+
+  /*
+    因為分析頻率提高，改成連續 4 次在中央才算成功，
+    避免手機晃一下就誤判完成。
+  */
+  if (centeredCount >= 4) {
+    centeredCount = 4;
+
+    vibrateCentered();
+
+    announce(
+      "已對準" +
+      bestOverall.name +
+      "。",
+      true
+    );
+  }
+}
+
+
+/* =====================================================
+   事件
+===================================================== */
+
+startButton.addEventListener("click", startCamera);
+stopButton.addEventListener("click", stopCamera);
+window.addEventListener("pagehide", stopCamera);
+
+
+/* =====================================================
+   一開頁面就背景準備辨識
+===================================================== */
+
+prepareRecognition();
+</script>
+</body>
+</html>
